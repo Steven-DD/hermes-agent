@@ -157,9 +157,13 @@ _MARKDOWN_HINT_RE = re.compile(
 # Detect markdown tables: a line starting with | followed by a separator line.
 # Feishu post-type 'md' elements do not render tables, so we force text mode.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
+# Count data rows in a markdown table (skip header and separator)
+_MARKDOWN_TABLE_ROW_RE = re.compile(r"^\|.*\|[ \t]*$", re.MULTILINE)
+# Card table threshold: ≥1 row → use interactive card with table component
+_CARD_TABLE_MIN_ROWS = 1
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
-_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
+_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$", re.MULTILINE)
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$", re.MULTILINE)
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
@@ -4151,6 +4155,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if sender_ids and self._admins and (sender_ids & self._admins):
             return True
 
+        # Respect FEISHU_ALLOW_ALL_USERS for interactive card actions
+        if os.getenv("FEISHU_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+
         rule = self._group_rules.get(chat_id) if chat_id else None
         if rule:
             policy = rule.policy
@@ -4375,10 +4383,89 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        # Card JSON detection: if content is a Feishu card JSON 2.0 (starts with
+        # {"schema":"2.0"...}), deliver as interactive card message directly.
+        stripped = content.strip()
+
+        # Layer 0: @@json@@ delimiter — most reliable, agent-explicit marker.
+        # Agent wraps card JSON as @@json@@\n{...}\n@@json@@, gateway extracts
+        # everything between the markers. Deterministic, no guesswork.
+        candidates = []
+        json_marker_start = stripped.find('@@json@@')
+        if json_marker_start != -1:
+            after_start = json_marker_start + len('@@json@@')
+            json_marker_end = stripped.find('@@json@@', after_start)
+            if json_marker_end != -1:
+                inner = stripped[after_start:json_marker_end].strip()
+                if inner.startswith('{'):
+                    candidates.append(inner)
+
+        # Layer 1: raw content starts with {
+        # Layer 2: extract from markdown code fences
+        # (agents sometimes write ```json\n{...}\n``` which should still be a card).
+        # Layer 3: search anywhere in the content — agents often prefix cards with text.
+        candidates.append(stripped)
+        fence_match = _MARKDOWN_FENCE_OPEN_RE.search(stripped)
+        if fence_match:
+            start = fence_match.end()
+            rest = stripped[start:]
+            close_match = _MARKDOWN_FENCE_CLOSE_RE.search(rest)
+            if close_match:
+                inner = rest[:close_match.start()].strip()
+                if inner.startswith('{'):
+                    candidates.append(inner)
+
+        # Fallback: search for {"schema":"2.0" anywhere in the message
+        # and extract from that { using brace counting to find the matching }.
+        schema_pos = stripped.find('{"schema":"2.0"')
+        if schema_pos > 0:  # not at position 0 (already handled above)
+            # Brace-count to find the matching closing brace
+            depth = 0
+            close_pos = -1
+            in_string = False
+            escape_next = False
+            for i in range(schema_pos, len(stripped)):
+                c = stripped[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if c == '\\':
+                    escape_next = True
+                    continue
+                if c == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        close_pos = i
+                        break
+            if close_pos > schema_pos:
+                snippet = stripped[schema_pos:close_pos + 1]
+                if snippet not in candidates:
+                    candidates.append(snippet)
+
+        for candidate in candidates:
+            if candidate.startswith('{') and '"schema"' in candidate[:200]:
+                try:
+                    card = json.loads(candidate)
+                    if card.get("schema") == "2.0" and ("header" in card or "body" in card):
+                        return "interactive", candidate
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
+            row_count = self._count_table_rows(content)
+            if row_count > 5:
+                card_json = self._build_card_table_payload(content)
+                if card_json:
+                    return "interactive", card_json
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):
@@ -4851,6 +4938,95 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _build_post_payload(self, content: str) -> str:
         return _build_markdown_post_payload(content)
+
+    @staticmethod
+    def _count_table_rows(content: str) -> int:
+        """Count data rows in a markdown table (header + separator excluded)."""
+        lines = content.split("\n")
+        count = 0
+        found_separator = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+            if not found_separator:
+                if _MARKDOWN_TABLE_RE.match(stripped + "\n"):
+                    found_separator = True
+                continue
+            if stripped.startswith("|") and stripped.endswith("|"):
+                count += 1
+        return count
+
+    @staticmethod
+    def _build_card_table_payload(content: str, title: str = "📊 数据表") -> str | None:
+        """Convert a markdown table to Feishu card JSON 2.0 with table component."""
+        lines = content.split("\n")
+        header = []
+        rows = []
+        found_separator = False
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if not found_separator:
+                header = cells
+                found_separator = True
+                continue
+            if all(c.replace("-", "").replace(":", "").replace(" ", "") == "" for c in cells):
+                continue  # skip separator line
+            if cells and any(c for c in cells):
+                rows.append(cells)
+
+        if not header or not rows:
+            return None
+
+        # Build columns
+        columns = []
+        for i, col_name in enumerate(header):
+            if not col_name:
+                col_name = f"col{i}"
+            col = {"name": f"c{i}", "display_name": col_name, "data_type": "text", "width": "auto"}
+            columns.append(col)
+
+        # Build rows
+        card_rows = []
+        for row in rows:
+            row_data = {}
+            for i, cell in enumerate(row):
+                if i < len(columns):
+                    row_data[f"c{i}"] = cell
+            if row_data:
+                card_rows.append(row_data)
+
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "blue",
+                "title": {"content": title, "tag": "plain_text"}
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "table",
+                        "page_size": min(len(card_rows), 10),
+                        "row_height": "low",
+                        "header_style": {
+                            "text_align": "left",
+                            "text_size": "normal",
+                            "background_style": "grey",
+                            "bold": True,
+                            "lines": 1,
+                        },
+                        "columns": columns,
+                        "rows": card_rows,
+                    }
+                ]
+            },
+        }
+        return json.dumps(card, ensure_ascii=False)
 
     def _build_media_post_payload(self, *, caption: str, media_tag: Dict[str, str]) -> str:
         payload = json.loads(self._build_post_payload(caption))
